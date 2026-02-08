@@ -4,12 +4,14 @@ const { uploadToSupabaseStorage } = require("../../utils/uploadSupabase");
 
 const getKepalaFeedback = async (req, res) => {
     try {
+        console.log('--- DEBUG KEPALA FEEDBACK ---');
+        console.log('User Role:', req.user.role);
         // Hanya kepala dan admin yang bisa akses
         if (req.user.role !== 'kepala' && req.user.role !== 'admin') {
             return res.status(403).json({ error: 'Akses ditolak' });
         }
 
-        const { data: feedback, error } = await supabase
+        const { data: feedback, error, count } = await supabase
             .from('feedback_disposisi')
             .select(`
             *,
@@ -21,6 +23,7 @@ const getKepalaFeedback = async (req, res) => {
               dengan_hormat_harap,
               created_by
             ),
+            users (name),
             surat_masuk (
               id,
               nomor_surat,
@@ -44,6 +47,7 @@ const getKepalaFeedback = async (req, res) => {
             console.error('Error fetching feedback for kepala:', error);
             return res.status(400).json({ error: error.message });
         }
+        console.log('Jumlah Data ditemukan di DB:', feedback ? feedback.length : 0);
 
         // Transform data dengan file info
         const transformedData = feedback?.map(item => {
@@ -405,8 +409,35 @@ const buatAtasanFeedback = async (req, res) => {
         const { role } = req.params;
         const { disposisiId } = req.params;
         const { notes, status } = req.body; // Tambahkan status dari request body
-        const userJabatan = req.user.jabatan;
-        const userName = req.user.name;
+
+        // --- PERBAIKAN: Ambil User & Join ke Tabel Jabatan ---
+        // Kita perlu nama jabatan ("Sekretaris") bukan ID-nya
+        const { data: userData, error: userError } = await supabase
+            .from('users')
+            .select(`
+                name,
+                jabatan_id,
+                jabatan:jabatan_id ( nama )
+            `)
+            .eq('id', req.user.id)
+            .single();
+
+        if (userError || !userData) {
+            console.error('Error fetch user data:', userError);
+            return res.status(401).json({ error: 'Data user tidak ditemukan' });
+        }
+
+        // Ambil string nama jabatan dari hasil join
+        // Jika relasi gagal atau null, fallback ke manual check nanti
+        const userJabatan = userData.jabatan?.nama;
+        const userName = userData.name;
+
+        // Validasi Jabatan
+        if (!userJabatan) {
+            console.error('Jabatan user kosong/tidak valid. User ID:', req.user.id);
+            return res.status(400).json({ error: 'Data jabatan user tidak valid atau tidak ditemukan' });
+        }
+        // -----------------------------------------------------
 
         if (!['user', 'sekretaris'].includes(role)) {
             return res.status(400).json({ error: 'Role tidak valid' });
@@ -432,10 +463,11 @@ const buatAtasanFeedback = async (req, res) => {
             .from('disposisi')
             .select(`id, disposisi_kepada_jabatan, perihal, created_by, surat_masuk_id, status, ${statusField}`)
             .eq('id', disposisiId)
-            .eq('disposisi_kepada_jabatan', userJabatan)
+            .eq('disposisi_kepada_jabatan', userJabatan) // Sekarang userJabatan sudah benar ("Sekretaris")
             .single();
 
         if (disposisiError || !disposisi) {
+            console.error('Disposisi Not Found Debug:', { disposisiId, userJabatan, error: disposisiError });
             return res.status(404).json({
                 error: 'Disposisi tidak ditemukan atau tidak ditujukan untuk jabatan Anda'
             });
@@ -707,7 +739,20 @@ const getEditFeedbackAtasan = async (req, res) => {
         const { role } = req.params;
         const { feedbackId } = req.params;
         const userId = req.user.id;
-        const userJabatan = req.user.jabatan;
+
+        // --- FIX: Ambil Data User & Join Jabatan ---
+        const { data: userData, error: userError } = await supabase
+            .from('users')
+            .select(`name, jabatan_id, jabatan:jabatan_id ( nama )`)
+            .eq('id', userId)
+            .single();
+
+        if (userError || !userData) {
+            return res.status(401).json({ error: 'Data user tidak ditemukan' });
+        }
+
+        const userJabatan = userData.jabatan?.nama; // "Sekretaris"
+        // ------------------------------------------
 
         if (!['user', 'sekretaris'].includes(role)) {
             return res.status(400).json({ error: 'Role tidak valid' });
@@ -719,33 +764,33 @@ const getEditFeedbackAtasan = async (req, res) => {
         const { data: feedback, error } = await supabase
             .from('feedback_disposisi')
             .select(`
-        *,
-        disposisi (
-          id,
-          perihal,
-          sifat,
-          disposisi_kepada_jabatan,
-          dengan_hormat_harap,
-          created_at,
-          status,
-          ${statusField},
-          surat_masuk (
-            id,
-            keterangan
-          )
-        ),
-        feedback_files (
-          id,
-          file_original_name,
-          file_size,
-          file_type,
-          file_path,
-          storage_path
-        )
-      `)
+                *,
+                disposisi (
+                    id,
+                    perihal,
+                    sifat,
+                    disposisi_kepada_jabatan,
+                    dengan_hormat_harap,
+                    created_at,
+                    status,
+                    ${statusField},
+                    surat_masuk (
+                        id,
+                        keterangan
+                    )
+                ),
+                feedback_files (
+                    id,
+                    file_original_name,
+                    file_size,
+                    file_type,
+                    file_path,
+                    storage_path
+                )
+            `)
             .eq('id', feedbackId)
             .eq('user_id', userId)
-            .eq('user_jabatan', userJabatan)
+            .eq('user_jabatan', userJabatan) // Menggunakan string jabatan yang benar
             .single();
 
         if (error || !feedback) {
@@ -775,16 +820,28 @@ const editFeedbackAtasan = async (req, res) => {
         const { feedbackId } = req.params;
         const { notes, status, remove_file_ids } = req.body;
         const userId = req.user.id;
-        const userJabatan = req.user.jabatan;
+
+        // --- FIX: Ambil Data User & Join Jabatan ---
+        const { data: userData, error: userError } = await supabase
+            .from('users')
+            .select(`name, jabatan_id, jabatan:jabatan_id ( nama )`)
+            .eq('id', userId)
+            .single();
+
+        if (userError || !userData) {
+            return res.status(401).json({ error: 'Data user tidak ditemukan' });
+        }
+
+        const userJabatan = userData.jabatan?.nama; // "Sekretaris"
+        // ------------------------------------------
+
         const statusField = role === 'user' ? 'status_dari_kabid' : 'status_dari_sekretaris';
 
         console.log('Edit feedback request:', {
             feedbackId,
-            notes,
+            userJabatan, // Log untuk memastikan
             status,
-            statusField,
-            newFilesCount: req.files?.length,
-            removeFileIds: remove_file_ids
+            statusField
         });
 
         // Validasi input - sama seperti di create feedback
@@ -804,20 +861,20 @@ const editFeedbackAtasan = async (req, res) => {
         const { data: existingFeedback, error: feedbackError } = await supabase
             .from('feedback_disposisi')
             .select(`
-        *,
-        disposisi (
-          id,
-          perihal,
-          created_by,
-          surat_masuk_id,
-          disposisi_kepada_jabatan,
-          status,
-          ${statusField}
-        )
-      `)
+                *,
+                disposisi (
+                    id,
+                    perihal,
+                    created_by,
+                    surat_masuk_id,
+                    disposisi_kepada_jabatan,
+                    status,
+                    ${statusField}
+                )
+            `)
             .eq('id', feedbackId)
             .eq('user_id', userId)
-            .eq('user_jabatan', userJabatan)
+            .eq('user_jabatan', userJabatan) // Validasi jabatan string
             .single();
 
         if (feedbackError || !existingFeedback) {

@@ -6,10 +6,28 @@ const buatFeedbackBawahan = async (req, res) => {
         const { disposisiId } = req.params;
         const { notes, status, status_dari_bawahan } = req.body;
         const userId = req.user.id;
-        const userJabatan = req.user.jabatan;
-        const userName = req.user.name;
 
-        console.log('Bawahan feedback request:', { disposisiId, notes, status, status_dari_bawahan, filesCount: req.files?.length });
+        // --- FIX: Ambil User & Join Jabatan ---
+        const { data: userData, error: userError } = await supabase
+            .from('users')
+            .select(`name, jabatan_id, jabatan:jabatan_id ( nama )`)
+            .eq('id', userId)
+            .single();
+
+        if (userError || !userData) {
+            return res.status(401).json({ error: 'Data user tidak ditemukan' });
+        }
+
+        const userJabatan = userData.jabatan?.nama; // String "Staff IT" dsb
+        const userName = userData.name;
+        // --------------------------------------
+
+        console.log('Bawahan feedback request:', { 
+            disposisiId, 
+            userJabatan, // Cek log ini nanti
+            status, 
+            status_dari_bawahan 
+        });
 
         // Validasi input
         if (!notes || notes.trim() === '') {
@@ -19,12 +37,6 @@ const buatFeedbackBawahan = async (req, res) => {
         }
 
         if (!status || !['diproses', 'selesai'].includes(status)) {
-            return res.status(400).json({
-                error: 'Status disposisi wajib dipilih dan harus berupa "diproses" atau "selesai"'
-            });
-        }
-
-        if (!status_dari_bawahan || !['diproses', 'selesai'].includes(status_dari_bawahan)) {
             return res.status(400).json({
                 error: 'Status disposisi wajib dipilih dan harus berupa "diproses" atau "selesai"'
             });
@@ -49,7 +61,7 @@ const buatFeedbackBawahan = async (req, res) => {
             .from('feedback_disposisi')
             .select('id')
             .eq('disposisi_id', disposisiId)
-            .eq('user_id', userId) // Tambahkan filter user_id untuk feedback bawahan
+            .eq('user_id', userId)
             .single();
 
         if (existingFeedback) {
@@ -58,12 +70,12 @@ const buatFeedbackBawahan = async (req, res) => {
             });
         }
 
-        // Data feedback bawahan (menggunakan tabel yang sama)
+        // Data feedback bawahan
         const feedbackData = {
             disposisi_id: disposisiId,
             surat_masuk_id: disposisi.surat_masuk_id,
             user_id: userId,
-            user_jabatan: userJabatan,
+            user_jabatan: userJabatan, // Sekarang sudah string yang benar
             user_name: userName,
             notes: notes.trim(),
             created_at: new Date(new Date().getTime() + (7 * 60 * 60 * 1000)).toISOString()
@@ -93,7 +105,7 @@ const buatFeedbackBawahan = async (req, res) => {
             try {
                 const uploadResults = await Promise.all(uploadPromises);
 
-                // Simpan data file ke database (tabel yang sama)
+                // Simpan data file ke database
                 const fileData = uploadResults.map(result => ({
                     feedback_id: feedbackResult.id,
                     disposisi_id: disposisiId,
@@ -111,13 +123,10 @@ const buatFeedbackBawahan = async (req, res) => {
                     .insert(fileData);
 
                 if (fileError) {
-                    // Rollback: hapus feedback dan files dari storage
+                    // Rollback
                     await supabase.from('feedback_disposisi').delete().eq('id', feedbackResult.id);
-
-                    // Hapus files dari Supabase Storage
                     const filesToDelete = uploadResults.map(r => r.fileName);
                     await supabase.storage.from('surat-photos').remove(filesToDelete);
-
                     return res.status(400).json({ error: 'Gagal menyimpan file: ' + fileError.message });
                 }
 
@@ -125,18 +134,17 @@ const buatFeedbackBawahan = async (req, res) => {
                 console.log(`${fileCount} files uploaded successfully`);
             } catch (uploadError) {
                 console.error('Upload error:', uploadError);
-                // Rollback feedback jika upload gagal
                 await supabase.from('feedback_disposisi').delete().eq('id', feedbackResult.id);
                 return res.status(400).json({ error: 'Gagal upload file: ' + uploadError.message });
             }
         }
 
-        // Update status disposisi dan has_feedback_bawahan
+        // Update status disposisi
         const { error: updateError } = await supabase
             .from('disposisi')
             .update({
                 status: status,
-                status_dari_bawahan: status_dari_bawahan, // Update status dari bawahan
+                status_dari_bawahan: status_dari_bawahan,
                 has_feedback: true
             })
             .eq('id', disposisiId);
@@ -153,6 +161,7 @@ const buatFeedbackBawahan = async (req, res) => {
             disposisi_id: disposisiId,
             status: status,
             oleh_user_id: userId,
+            // Log sekarang akan menampilkan nama jabatan yang benar
             keterangan: `Feedback dari bawahan: ${status} oleh ${userJabatan}`
         };
 
@@ -306,51 +315,57 @@ const getEditFeedbackBawahan = async (req, res) => {
     try {
         const { feedbackId } = req.params;
         const userId = req.user.id;
-        const userJabatan = req.user.jabatan;
 
-        // Ambil detail feedback dengan validasi kepemilikan
+        // --- DEBUGGING LOG (Wajib cek terminal jika masih error) ---
+        console.log('--- DEBUG EDIT VIEW BAWAHAN ---');
+        console.log('Feedback ID:', feedbackId);
+        console.log('User ID Login:', userId);
+        // ---------------------------------------------------------
+
+        // Ambil detail feedback 
+        // HAPUS filter .eq('user_jabatan', ...) agar data lama yg jabatannya null tetap bisa diedit
         const { data: feedback, error } = await supabase
             .from('feedback_disposisi')
             .select(`
-        *,
-        disposisi (
-          id,
-          perihal,
-          sifat,
-          disposisi_kepada_jabatan,
-          dengan_hormat_harap,
-          created_at,
-          status,
-          status_dari_bawahan,
-          catatan_atasan,
-          surat_masuk (
-            id,
-            keterangan
-          )
-        ),
-        feedback_files (
-          id,
-          file_original_name,
-          file_size,
-          file_type,
-          file_path,
-          storage_path
-        )
-      `)
+                *,
+                disposisi (
+                  id,
+                  perihal,
+                  sifat,
+                  disposisi_kepada_jabatan,
+                  dengan_hormat_harap,
+                  created_at,
+                  status,
+                  status_dari_bawahan,
+                  catatan_atasan,
+                  surat_masuk (
+                    id,
+                    keterangan
+                  )
+                ),
+                feedback_files (
+                  id,
+                  file_original_name,
+                  file_size,
+                  file_type,
+                  file_path,
+                  storage_path
+                )
+            `)
             .eq('id', feedbackId)
-            .eq('user_id', userId)
-            .eq('user_jabatan', userJabatan)
+            .eq('user_id', userId) // Cukup validasi User ID saja (Security sudah aman)
             .single();
 
         if (error || !feedback) {
+            console.error('Error DB / Not Found:', error);
             return res.status(404).json({
-                error: 'Feedback tidak ditemukan atau tidak ada akses untuk mengedit'
+                error: 'Feedback tidak ditemukan atau Anda tidak memiliki akses'
             });
         }
 
         // Transform file data
         const files = feedback.feedback_files?.map(file => {
-            let fileUrl = `/api/bawahan/feedback/file/${file.id}`;
+            let fileUrl = `/api/v1/feedback-disposisi/bawahan/${file.id}`; // Sesuaikan path jika perlu
 
             if (file.file_path && file.file_path.startsWith('http')) {
                 fileUrl = file.file_path;
@@ -393,48 +408,53 @@ const editFeedbackBawahan = async (req, res) => {
         const { feedbackId } = req.params;
         const { notes, status, status_dari_bawahan, remove_file_ids } = req.body;
         const userId = req.user.id;
-        const userJabatan = req.user.jabatan;
+
+        // 1. Ambil User & Join Jabatan (Untuk Update Data nanti)
+        const { data: userData, error: userError } = await supabase
+            .from('users')
+            .select(`name, jabatan_id, jabatan:jabatan_id ( nama )`)
+            .eq('id', userId)
+            .single();
+
+        if (userError || !userData) {
+            return res.status(401).json({ error: 'Data user tidak ditemukan' });
+        }
+        const userJabatan = userData.jabatan?.nama;
+        // --------------------------------------
 
         console.log('Edit bawahan feedback request:', {
             feedbackId,
-            notes,
-            status,
-            status_dari_bawahan,
-            newFilesCount: req.files?.length,
-            removeFileIds: remove_file_ids
+            userJabatan, // Ini jabatan yang BENAR
+            status
         });
 
         // Validasi input
         if (!notes || notes.trim() === '') {
-            return res.status(400).json({
-                error: 'Notes/catatan feedback wajib diisi'
-            });
+            return res.status(400).json({ error: 'Notes/catatan feedback wajib diisi' });
         }
 
         if (!status || !['diproses', 'selesai'].includes(status)) {
-            return res.status(400).json({
-                error: 'Status disposisi wajib dipilih dan harus berupa "diproses" atau "selesai"'
-            });
+            return res.status(400).json({ error: 'Status disposisi wajib dipilih' });
         }
 
-        // Pastikan feedback ada dan milik user
+        // --- PERBAIKAN DI SINI ---
+        // Hapus .eq('user_jabatan', ...) agar data lama yg bug tetap bisa diedit
         const { data: existingFeedback, error: feedbackError } = await supabase
             .from('feedback_disposisi')
             .select(`
-        *,
-        disposisi (
-          id,
-          perihal,
-          created_by,
-          surat_masuk_id,
-          diteruskan_kepada_user_id,
-          status,
-          status_dari_bawahan
-        )
-      `)
+                *,
+                disposisi (
+                  id,
+                  perihal,
+                  created_by,
+                  surat_masuk_id,
+                  diteruskan_kepada_user_id,
+                  status,
+                  status_dari_bawahan
+                )
+            `)
             .eq('id', feedbackId)
-            .eq('user_id', userId)
-            .eq('user_jabatan', userJabatan)
+            .eq('user_id', userId) // Cukup validasi ID User saja
             .single();
 
         if (feedbackError || !existingFeedback) {
@@ -443,9 +463,11 @@ const editFeedbackBawahan = async (req, res) => {
             });
         }
 
-        // Update data feedback
+        // --- UPDATE DATA ---
+        // Kita sekalian perbaiki data user_jabatan di database
         const updateData = {
             notes: notes.trim(),
+            user_jabatan: userJabatan, // <--- UPDATE JABATAN BIAR FIX
             updated_at: new Date(new Date().getTime() + (7 * 60 * 60 * 1000)).toISOString()
         };
 
@@ -461,7 +483,7 @@ const editFeedbackBawahan = async (req, res) => {
             return res.status(400).json({ error: updateError.message });
         }
 
-        // Handle penghapusan file lama (sama seperti kabid)
+        // Handle penghapusan file lama (sama seperti sebelumnya)
         let removedFileCount = 0;
         if (remove_file_ids) {
             try {
@@ -482,10 +504,6 @@ const editFeedbackBawahan = async (req, res) => {
                         const { error: storageError } = await supabase.storage
                             .from('surat-photos')
                             .remove(storageFilesToDelete);
-
-                        if (storageError) {
-                            console.error('Error removing files from storage:', storageError);
-                        }
                     }
 
                     const { error: removeError } = await supabase
@@ -494,9 +512,7 @@ const editFeedbackBawahan = async (req, res) => {
                         .eq('feedback_id', feedbackId)
                         .in('id', removeIds);
 
-                    if (removeError) {
-                        console.error('Error removing files from database:', removeError);
-                    } else {
+                    if (!removeError) {
                         removedFileCount = filesToRemove.length;
                     }
                 }
@@ -505,7 +521,7 @@ const editFeedbackBawahan = async (req, res) => {
             }
         }
 
-        // Upload file baru (sama seperti kabid)
+        // Upload file baru
         let newFileCount = 0;
         if (req.files && req.files.length > 0) {
             const uploadPromises = req.files.map(file =>
@@ -536,7 +552,6 @@ const editFeedbackBawahan = async (req, res) => {
                     await supabase.storage.from('surat-photos').remove(filesToDelete);
                     return res.status(400).json({ error: 'Gagal menyimpan file baru: ' + fileError.message });
                 }
-
                 newFileCount = req.files.length;
             } catch (uploadError) {
                 return res.status(400).json({ error: 'Gagal upload file baru: ' + uploadError.message });
@@ -569,11 +584,7 @@ const editFeedbackBawahan = async (req, res) => {
             .from('disposisi_status_log')
             .insert([statusLogData]);
 
-        if (logError) {
-            console.error('Error creating status log:', logError);
-        }
-
-        // Hitung total file setelah update
+        // Hitung total file
         const { data: remainingFiles } = await supabase
             .from('feedback_files')
             .select('id')
@@ -587,11 +598,7 @@ const editFeedbackBawahan = async (req, res) => {
                 ...updatedFeedback,
                 status_dari_bawahan: status,
                 file_count: totalFiles,
-                has_files: totalFiles > 0,
-                changes: {
-                    removed_files: removedFileCount,
-                    added_files: newFileCount
-                }
+                has_files: totalFiles > 0
             }
         });
 
